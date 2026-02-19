@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Generator, Optional
 
-from .client import completion, MAX_RESPONSE_TOKENS, MAX_TITLE_TOKENS
+from .client import completion, stream_text_deltas, MAX_RESPONSE_TOKENS, MAX_TITLE_TOKENS
 from .prompt_orchestrator import build_messages
 from .prompts import TITLE_PROMPT
 
@@ -38,8 +38,7 @@ def generate_response(
             privacy_mode=privacy_mode,
             greeting_name=greeting_name,
         )
-        response = completion(messages)
-        return response.choices[0].message.content
+        return completion(messages)
     except Exception as e:
         logger.error("Generation error: %s", e)
         return f"I apologize, but I encountered an error: {e}"
@@ -74,11 +73,8 @@ def generate_response_stream(
         greeting_name=greeting_name,
     )
     try:
-        stream = completion(messages, stream=True)
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                yield f'0:{json.dumps(delta.content)}\n'
+        for text in stream_text_deltas(messages):
+            yield f'0:{json.dumps(text)}\n'
         yield f'e:{json.dumps({"finishReason": "stop"})}\n'
         yield f'd:{json.dumps({"finishReason": "stop"})}\n'
     except Exception as e:
@@ -95,8 +91,7 @@ def generate_title(user_message: str) -> str:
             {"role": "system", "content": TITLE_PROMPT},
             {"role": "user", "content": user_message},
         ]
-        response = completion(messages, temperature=0.5, max_tokens=MAX_TITLE_TOKENS)
-        title = response.choices[0].message.content.strip().strip('"').strip("'")
+        title = completion(messages, temperature=0.5, max_tokens=MAX_TITLE_TOKENS).strip().strip('"').strip("'")
         return title[:50] if len(title) > 50 else title
     except Exception as e:
         logger.error("Title generation error: %s", e)

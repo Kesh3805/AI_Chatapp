@@ -1,12 +1,15 @@
-# query_db.py – PostgreSQL + pgvector: Intent-gated architecture
-#
-# Replaced 3-layer memory system with:
-#   - user_profile (structured key/value identity data)
-#   - user_queries  (per-query embeddings, used only for KB/continuation intents)
-#   - conversations + chat_messages (unchanged)
-#
-# Removed: memories table, conversation summaries, memory extraction
-#
+"""PostgreSQL + pgvector persistence layer.
+
+Single database for all storage needs:
+  - conversations & chat_messages  — conversation history
+  - user_queries                   — per-query embeddings for semantic Q&A search
+  - user_profile                   — key-value personal data
+  - document_chunks                — knowledge base vector store (pgvector)
+  - conversations.topic_embedding  — rolling topic anchor per conversation
+
+Connection pooling via psycopg2 SimpleConnectionPool.
+DATABASE_URL env var takes priority over individual POSTGRES_* vars.
+"""
 import math
 import os
 import uuid
@@ -18,18 +21,16 @@ import numpy as np
 import psycopg2
 from psycopg2.extras import Json
 from psycopg2 import pool
-from dotenv import load_dotenv
 
-load_dotenv()
+from settings import settings
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-#  Connection config — DATABASE_URL takes priority (docker-compose / prod),
-#  falls back to individual env vars for local dev.
+#  Connection config — DATABASE_URL takes priority, falls back to settings.
 # ---------------------------------------------------------------------------
-_database_url = os.getenv("DATABASE_URL")
-if _database_url:
-    _p = urlparse(_database_url)
+if settings.DATABASE_URL:
+    _p = urlparse(settings.DATABASE_URL)
     DB_CONFIG = {
         "host": _p.hostname or "localhost",
         "port": _p.port or 5432,
@@ -39,11 +40,11 @@ if _database_url:
     }
 else:
     DB_CONFIG = {
-        "host": os.getenv("POSTGRES_HOST", "localhost"),
-        "port": int(os.getenv("POSTGRES_PORT", "55432")),
-        "database": os.getenv("POSTGRES_DB", "chatapp"),
-        "user": os.getenv("POSTGRES_USER", "root"),
-        "password": os.getenv("POSTGRES_PASSWORD", "password"),
+        "host": settings.POSTGRES_HOST,
+        "port": settings.POSTGRES_PORT,
+        "database": settings.POSTGRES_DB,
+        "user": settings.POSTGRES_USER,
+        "password": settings.POSTGRES_PASSWORD,
     }
 
 # Connection pool — replaces individual get_connection() calls
@@ -53,7 +54,11 @@ _pool: pool.SimpleConnectionPool | None = None
 def _get_pool() -> pool.SimpleConnectionPool:
     global _pool
     if _pool is None or _pool.closed:
-        _pool = pool.SimpleConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
+        _pool = pool.SimpleConnectionPool(
+            minconn=settings.DB_POOL_MIN,
+            maxconn=settings.DB_POOL_MAX,
+            **DB_CONFIG,
+        )
     return _pool
 
 
@@ -102,8 +107,11 @@ def init_db():
             pass
 
         # Migration: add topic_embedding (rolling topic anchor vector)
+        # NOTE: if you change EMBEDDING_DIMENSION on an existing DB you must
+        # DROP and recreate this column (ALTER COLUMN cannot change vector size).
         try:
-            cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS topic_embedding vector(384);")
+            dim = settings.EMBEDDING_DIMENSION
+            cur.execute(f"ALTER TABLE conversations ADD COLUMN IF NOT EXISTS topic_embedding vector({dim});")
         except Exception:
             pass
 
@@ -121,15 +129,16 @@ def init_db():
         """)
 
         # ── user_queries (semantic search over past Q&A) ──────────
-        cur.execute("""
+        _dim = settings.EMBEDDING_DIMENSION
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS user_queries (
                 id              SERIAL PRIMARY KEY,
                 query_text      TEXT NOT NULL,
-                embedding       vector(384),
+                embedding       vector({_dim}),
                 user_id         TEXT DEFAULT 'public',
                 conversation_id TEXT,
                 response_text   TEXT,
-                tags            TEXT[] DEFAULT '{}',
+                tags            TEXT[] DEFAULT '{{}}',
                 timestamp       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 metadata        JSONB
             );
@@ -167,6 +176,29 @@ def init_db():
             """)
         except Exception:
             pass
+
+        # ── document_chunks (pgvector knowledge base) ─────────────
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id          SERIAL PRIMARY KEY,
+                content     TEXT NOT NULL,
+                embedding   vector({_dim}),
+                source      TEXT DEFAULT 'default',
+                chunk_index INTEGER DEFAULT 0,
+                metadata    JSONB DEFAULT '{{}}',
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        try:
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_doc_chunks_emb
+                ON document_chunks USING hnsw (embedding vector_cosine_ops);
+            """)
+        except Exception:
+            pass
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_doc_chunks_src ON document_chunks(source);"
+        )
 
         conn.commit()
         cur.close()
@@ -688,3 +720,82 @@ def get_first_user_message(conversation_id):
     except Exception as e:
         logger.error(f"Error getting first msg: {e}")
         return None
+
+
+# ═══════════════════ DOCUMENT CHUNKS (pgvector knowledge base) ═══════════════════
+
+def store_document_chunks(chunks: list[str], source: str = "default") -> int:
+    """Embed and store document chunks in pgvector.  Returns count stored."""
+    if not chunks:
+        return 0
+    try:
+        from embeddings import get_embeddings
+
+        embeddings = get_embeddings(chunks)
+        conn = get_connection()
+        cur = conn.cursor()
+        for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
+            cur.execute("""
+                INSERT INTO document_chunks (content, embedding, source, chunk_index)
+                VALUES (%s, %s::vector, %s, %s)
+            """, (chunk, emb.tolist(), source, i))
+        conn.commit()
+        cur.close()
+        put_connection(conn)
+        logger.info(f"Stored {len(chunks)} chunks (source={source})")
+        return len(chunks)
+    except Exception as e:
+        logger.error(f"Error storing document chunks: {e}")
+        return 0
+
+
+def search_document_chunks(embedding, k: int = 4) -> list[str]:
+    """Semantic search over document chunks.  Returns chunk content strings."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        emb = embedding.tolist() if isinstance(embedding, np.ndarray) else embedding
+        cur.execute("""
+            SELECT content, 1 - (embedding <=> %s::vector) AS similarity
+            FROM document_chunks
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        """, (emb, emb, k))
+        results = cur.fetchall()
+        cur.close()
+        put_connection(conn)
+        return [r[0] for r in results]
+    except Exception as e:
+        logger.error(f"Error searching document chunks: {e}")
+        return []
+
+
+def count_document_chunks() -> int:
+    """Return the total number of indexed document chunks."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM document_chunks")
+        count = cur.fetchone()[0]
+        cur.close()
+        put_connection(conn)
+        return count
+    except Exception as e:
+        logger.error(f"Error counting document chunks: {e}")
+        return 0
+
+
+def clear_document_chunks(source: str | None = None) -> None:
+    """Delete document chunks (optionally filtered by source)."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        if source:
+            cur.execute("DELETE FROM document_chunks WHERE source = %s", (source,))
+        else:
+            cur.execute("DELETE FROM document_chunks")
+        conn.commit()
+        cur.close()
+        put_connection(conn)
+    except Exception as e:
+        logger.error(f"Error clearing document chunks: {e}")

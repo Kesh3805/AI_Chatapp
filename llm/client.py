@@ -1,28 +1,26 @@
-"""Pure Cerebras API client — zero behavior logic.
+"""LLM client — thin wrapper that delegates to the configured provider.
 
-Every LLM call goes through ``completion()``.  This file knows nothing
-about intents, prompts, profiles, or application behavior.
+Every module in llm/ calls these functions.  The actual provider
+(Cerebras, OpenAI, Anthropic) is determined by LLM_PROVIDER in settings.
+
+Usage:
+    from llm.client import completion, stream_text_deltas, MAX_RESPONSE_TOKENS
 """
 
-import os
+from __future__ import annotations
+
 import logging
+from typing import Generator
 
-from cerebras.cloud.sdk import Cerebras
-from dotenv import load_dotenv
-
-load_dotenv()
+from settings import settings
 
 logger = logging.getLogger(__name__)
 
-# ── Client ────────────────────────────────────────────────────────────────
-_client = Cerebras(api_key=os.environ.get("CEREBRAS_API_KEY"))
-CEREBRAS_MODEL = os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")
-
-# ── Token budgets (gpt-oss-120b context = 65 536) ────────────────────────
-MAX_RESPONSE_TOKENS = 2048
-MAX_CLASSIFIER_TOKENS = 50
-MAX_PROFILE_DETECT_TOKENS = 300
-MAX_TITLE_TOKENS = 20
+# ── Token budgets (re-exported from settings for backward compat) ─────────
+MAX_RESPONSE_TOKENS = settings.MAX_RESPONSE_TOKENS
+MAX_CLASSIFIER_TOKENS = settings.MAX_CLASSIFIER_TOKENS
+MAX_PROFILE_DETECT_TOKENS = settings.MAX_PROFILE_DETECT_TOKENS
+MAX_TITLE_TOKENS = settings.MAX_TITLE_TOKENS
 
 
 def completion(
@@ -30,17 +28,28 @@ def completion(
     *,
     temperature: float = 0.3,
     max_tokens: int = MAX_RESPONSE_TOKENS,
-    stream: bool = False,
-):
-    """Send a chat-completion request to Cerebras.
+) -> str:
+    """Send a chat-completion request and return the response text."""
+    from .providers import provider
 
-    Returns the full response object (``stream=False``) or an iterator
-    (``stream=True``).
-    """
-    return _client.chat.completions.create(
-        model=CEREBRAS_MODEL,
-        messages=messages,
+    return provider().complete(
+        messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        stream=stream,
+    )
+
+
+def stream_text_deltas(
+    messages: list[dict],
+    *,
+    temperature: float = 0.3,
+    max_tokens: int = MAX_RESPONSE_TOKENS,
+) -> Generator[str, None, None]:
+    """Send a streaming request and yield text deltas."""
+    from .providers import provider
+
+    return provider().stream_text_deltas(
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )

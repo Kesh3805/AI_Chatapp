@@ -1,57 +1,89 @@
 """FastAPI application — policy-driven intent-gated selective retrieval.
 
 Architecture layers:
-  1. Policy Engine  (policy.py)  — deterministic behavior rules
-  2. LLM Package    (llm/)       — client, classifier, orchestrator, generators
-  3. Pipeline       (this file)  — orchestrates retrieval + generation
-  4. Database       (query_db.py)— persistence + vector search
-  5. Vector Store   (vector_store.py) — FAISS in-memory index
+  1. Settings       (settings.py)  — centralized configuration
+  2. Policy Engine  (policy.py)    — deterministic behavior rules
+  3. Hooks          (hooks.py)     — extension points
+  4. LLM Package    (llm/)         — pluggable providers, classifier, orchestrator
+  5. Pipeline       (this file)    — orchestrates retrieval + generation
+  6. Database       (query_db.py)  — persistence + vector search (pgvector)
+  7. Vector Store   (vector_store.py) — pgvector-backed document index
 
 Pipeline (shared by /chat and /chat/stream):
   1. Embed query
   2. Load state     (history + profile entries)
   3. Classify intent
   4. Topic gate     (prevents false continuation across domain jumps)
-  5. Extract features + policy resolve
+  5. Extract features + policy resolve + hooks
   6. History pruning
   7. Selective retrieval  (driven by policy decision)
   8. Generate response
-  9. Persist         (DB writes in background thread)
-"""
+  9. Persist         (DB writes via worker)
+"""""
 
 from __future__ import annotations
 
 import json
 import logging
-import threading
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import query_db
-from embeddings import get_embedding
+import vector_store
+import worker
+from embeddings import get_query_embedding
+from hooks import Hooks
 from llm.classifier import classify_intent
 from llm.generators import generate_response, generate_response_stream, generate_title
 from llm.profile_detector import detect_profile_updates
 from policy import BehaviorPolicy, extract_context_features
-from vector_store import add_documents, search
+from settings import settings
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+#  Application lifespan
+# ---------------------------------------------------------------------------
+DB_ENABLED = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: D401
+    """Run startup logic; yield to serve requests; clean up on shutdown."""
+    global DB_ENABLED
+    DB_ENABLED = query_db.init_db()
+    vector_store.init(DB_ENABLED)
+    if DB_ENABLED:
+        logger.info("PostgreSQL connected — full persistence active")
+    else:
+        logger.warning("PostgreSQL not available — in-memory only")
+
+    if not vector_store.has_documents() or settings.FORCE_REINDEX:
+        _ingest_knowledge()
+    else:
+        logger.info(f"Document store ready ({vector_store.count()} chunks)")
+
+    yield  # ← application runs here
+
+    # Shutdown: nothing to clean up currently
+
+
+# ---------------------------------------------------------------------------
 #  App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="RAG Chat", version="3.0.0")
+app = FastAPI(title="RAG Chat", version="4.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,8 +91,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-DB_ENABLED = False
 
 # ---------------------------------------------------------------------------
 #  Request / response models
@@ -86,34 +116,41 @@ class ProfileEntryRequest(BaseModel):
     category: str = "general"
 
 
-# ---------------------------------------------------------------------------
-#  Startup — load documents, init DB
-# ---------------------------------------------------------------------------
+def _ingest_knowledge():
+    """Read and index all files from the knowledge directory."""
+    kb_dir = Path(settings.KNOWLEDGE_DIR)
 
-@app.on_event("startup")
-def startup():
-    global DB_ENABLED
-    DB_ENABLED = query_db.init_db()
-    if DB_ENABLED:
-        logger.info("PostgreSQL connected — full persistence active")
-    else:
-        logger.warning("PostgreSQL not available — in-memory only")
+    if kb_dir.exists():
+        files = sorted(p for p in kb_dir.iterdir() if p.suffix in (".txt", ".md") and p.is_file())
+        if files:
+            if settings.FORCE_REINDEX:
+                vector_store.clear()
+            for path in files:
+                text = path.read_text(encoding="utf-8")
+                chunks = _chunk_text(text)
+                vector_store.add_documents(chunks, source=path.name)
+            logger.info(f"Indexed {len(files)} file(s) from {kb_dir}/")
+            return
 
-    with open("data.txt", "r", encoding="utf-8") as f:
-        text = f.read()
-    chunks = [text[i : i + 500] for i in range(0, len(text), 450)]
-    add_documents(chunks)
+    logger.warning("No knowledge base found — add .txt or .md files to knowledge/ and run: python cli.py ingest")
+
+
+def _chunk_text(text: str) -> list[str]:
+    """Split text into overlapping chunks based on settings."""
+    size = settings.CHUNK_SIZE
+    stride = size - settings.CHUNK_OVERLAP
+    return [text[i : i + size] for i in range(0, len(text), stride) if text[i : i + size].strip()]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SHARED PIPELINE — single source of truth for both endpoints
+#  SHARED PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Thresholds & constants
-TOPIC_CONTINUATION_THRESHOLD = 0.35
-RECENCY_WINDOW = 6
-SEM_K = 3
-SIM_THRESHOLD = 0.65
+# Thresholds from settings
+TOPIC_CONTINUATION_THRESHOLD = settings.TOPIC_CONTINUATION_THRESHOLD
+RECENCY_WINDOW = settings.RECENCY_WINDOW
+SEM_K = settings.SEMANTIC_K
+SIM_THRESHOLD = settings.SIMILARITY_THRESHOLD
 
 
 @dataclass
@@ -158,7 +195,7 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
     recent_messages: list = []
     profile_entries: list = []
     with ThreadPoolExecutor(max_workers=3) as pool:
-        fut_embed = pool.submit(get_embedding, query)
+        fut_embed = pool.submit(get_query_embedding, query)
         if DB_ENABLED:
             fut_history = pool.submit(query_db.get_recent_chat_messages, cid, 20)
             fut_profile = pool.submit(query_db.get_user_profile)
@@ -195,6 +232,7 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
         topic_similarity=topic_similarity,
     )
     decision = BehaviorPolicy().resolve(features, intent)
+    decision = Hooks.run_policy_override(features, decision)
     logger.info(
         f"Policy: route={decision.retrieval_route}, profile={decision.inject_profile}, "
         f"rag={decision.inject_rag}, qa={decision.inject_qa_history}, "
@@ -233,7 +271,7 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
     }
 
     if decision.inject_rag:
-        docs = search(query, k=decision.rag_k)
+        docs = vector_store.search(query, k=decision.rag_k)
         rag_context = "\n".join(docs)
         retrieval_info["num_docs"] = len(docs)
         if DB_ENABLED:
@@ -269,7 +307,7 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
     if decision.greeting_name:
         retrieval_info["greeting_personalized"] = True
 
-    return PipelineResult(
+    return Hooks.run_before_generation(PipelineResult(
         query=query,
         cid=cid,
         query_embedding=query_embedding,
@@ -284,13 +322,16 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
         query_tags=query_tags,
         privacy_mode=decision.privacy_mode,
         greeting_name=decision.greeting_name,
-    )
+    ))
 
 
 def persist_after_response(p: PipelineResult, response_text: str):
-    """Write messages / profile updates to DB in a background thread."""
+    """Write messages / profile updates to DB via background worker."""
     if not DB_ENABLED:
         return
+
+    response_text = Hooks.run_after_generation(response_text, p)
+    Hooks.run_before_persist(p, response_text)
 
     def _work():
         try:
@@ -305,7 +346,7 @@ def persist_after_response(p: PipelineResult, response_text: str):
                 tags=p.query_tags,
                 metadata={"intent": p.intent, "tags": p.query_tags},
             )
-            query_db.update_topic_vector(p.cid, p.query_embedding, alpha=0.1)
+            query_db.update_topic_vector(p.cid, p.query_embedding, alpha=settings.TOPIC_DECAY_ALPHA)
             query_db.store_chat_message(
                 role="user", content=p.query, conversation_id=p.cid,
                 tags=p.query_tags, metadata={"intent": p.intent},
@@ -334,7 +375,7 @@ def persist_after_response(p: PipelineResult, response_text: str):
         except Exception as e:
             logger.error(f"Persist error: {e}")
 
-    threading.Thread(target=_work, daemon=True).start()
+    worker.submit(_work)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -534,6 +575,24 @@ def chat_stream(request: ChatRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HEALTH CHECK
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/health")
+def health_check():
+    """Returns DB status, document count, and provider info."""
+    from llm.providers import provider as get_provider
+
+    return {
+        "status": "ok",
+        "database": "connected" if DB_ENABLED else "unavailable",
+        "documents": vector_store.count(),
+        "llm_provider": get_provider().name,
+        "version": app.version,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -16,6 +16,17 @@ services:
       timeout: 5s
       retries: 10
 
+  # Optional — uncomment to enable caching (set ENABLE_CACHE=true in .env)
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 5
+
   app:
     build: .
     ports:
@@ -23,14 +34,12 @@ services:
     env_file:
       - .env
     environment:
-      # Override DATABASE_URL so the app reaches the compose postgres service,
-      # not localhost (which is what .env has for local dev)
       DATABASE_URL: postgresql://root:password@postgres:5432/chatapp
+      # REDIS_URL: redis://redis:6379/0    # Uncomment with redis service
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
-      # Cache the sentence-transformers model across rebuilds
       - model_cache:/root/.cache/huggingface
 
 volumes:

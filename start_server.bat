@@ -1,7 +1,8 @@
 @echo off
-echo Starting RAG Chat App...
+echo Starting RAG Chat (v4.0.0)...
 echo.
-echo The first startup may take a moment to download the embedding model (~80MB)
+echo Tip: first startup downloads the embedding model (~80MB) and caches it.
+echo      Use "python cli.py ingest" to index your knowledge base files.
 echo.
 cd /d "%~dp0"
-.venv\Scripts\python.exe -m uvicorn main:app --reload --host 0.0.0.0
+.venv\Scripts\python.exe cli.py dev

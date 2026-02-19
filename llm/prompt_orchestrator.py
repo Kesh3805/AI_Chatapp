@@ -3,10 +3,20 @@
 This replaces the old ``_build_messages()`` helper.  It is policy-aware:
 flags like ``privacy_mode`` and ``greeting_name`` control which frames
 are injected, keeping that logic out of the generators.
+
+Token budgeting
+---------------
+Before appending conversation history, the history block is fitted to
+``settings.MAX_HISTORY_TOKENS`` via ``context_manager.fit_messages_to_budget``.
+When ``settings.ENABLE_HISTORY_SUMMARIZATION`` is True, overflowing turns
+are compressed into an LLM-generated summary instead of being silently
+dropped.
 """
 
 import logging
 
+import context_manager
+from settings import settings
 from .prompts import (
     SYSTEM_PROMPT,
     PROFILE_CONTEXT_FRAME,
@@ -86,9 +96,21 @@ def build_messages(
             "content": QA_CONTEXT_FRAME.format(qa=similar_qa_context),
         })
 
-    # ── Conversation history ──────────────────────────────────────────────
+    # ── Conversation history (token-budget enforced) ──────────────────────
     history = curated_history if curated_history is not None else chat_history
     if history:
+        if settings.ENABLE_HISTORY_SUMMARIZATION:
+            from .client import completion
+            history = context_manager.summarize_old_turns(
+                history,
+                max_history_tokens=settings.MAX_HISTORY_TOKENS,
+                completion_fn=completion,
+            )
+        else:
+            history = context_manager.fit_messages_to_budget(
+                history,
+                budget_tokens=settings.MAX_HISTORY_TOKENS,
+            )
         messages.extend(history)
 
     # ── Current user message ──────────────────────────────────────────────

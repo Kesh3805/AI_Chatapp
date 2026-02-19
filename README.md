@@ -1,178 +1,200 @@
-# RAG Chat App
+# RAG Chat
 
-A production-quality Retrieval-Augmented Generation (RAG) chat application with intent-gated selective retrieval, real-time token streaming, user profile memory, and a clean single-page UI.
+**Policy-driven, intent-gated RAG framework.** Stop building naive RAG. Start building systems that decide *what* to retrieve before they retrieve it.
 
-## Features
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green.svg)](https://fastapi.tiangolo.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-- **Intent-gated pipeline** — classifies every query before deciding what to retrieve
-  - `general` → LLM only, no retrieval
-  - `continuation` → curated conversation history + semantic pruning
-  - `knowledge_base` → FAISS document search + cross-conversation Q&A
-  - `profile` → user profile injection (query) or update-only (statement)
-  - `privacy` → transparent disclosure of stored data, offer deletion
-- **Real-time token streaming** — tokens appear live as they're generated (Vercel AI SDK data stream protocol over SSE)
-- **User profile memory** — background detection stores facts users explicitly share; injected transparently when relevant
-- **Topic similarity gate** — rolling topic vector prevents false "continuation" matches across domain jumps
-- **Semantic history pruning** — recency window + top-k semantic matches; never injects flat raw history
-- **Cerebras LLM** — `gpt-oss-120b` (65 536-token context) via OpenAI-compatible Python SDK
-- **FAISS + sentence-transformers** — local `all-MiniLM-L6-v2` embeddings, no additional API key needed
-- **PostgreSQL + pgvector** — persistent conversation store, cross-conversation similarity search
-- **Single-file UI** — plain HTML/CSS/JS, no build step
+---
 
-## Project Structure
+## What Makes This Different
 
-```
-.
-├── main.py          # FastAPI app — intent pipeline, all HTTP endpoints
-├── llm.py           # LLM calls — classifier, streaming + non-streaming response, profile detector, title generator
-├── query_db.py      # PostgreSQL helpers — conversations, messages, profile, topic vector
-├── vector_store.py  # FAISS wrapper — add and search document chunks
-├── embeddings.py    # sentence-transformers embedding helper
-├── index.html       # Single-page chat UI
-├── data.txt         # Knowledge base source document (edit to add your own content)
-├── requirements.txt
-├── .env.example
-├── start_server.bat # Windows quick-start
-└── start_server.sh  # Linux/macOS quick-start
-```
+Every message is **classified** before **any** retrieval:
+
+| Intent | What Gets Retrieved | Cost |
+|---|---|---|
+| `general` | Nothing  LLM only | Minimal |
+| `continuation` | Curated history + semantic pruning | Low |
+| `knowledge_base` | pgvector docs + cross-conversation Q&A | Full |
+| `profile` | User profile data (if a question) | Low |
+| `privacy` | Profile + transparency rules | Low |
+
+**No FAISS. No separate vector DB.** PostgreSQL + pgvector is the single database for conversations, messages, profiles, query embeddings, and document vectors.
+
+**Pluggable LLM providers.** Switch Cerebras  OpenAI  Anthropic  Ollama by changing two env vars.
+
+---
 
 ## Quick Start
 
-### 1. Clone & install
+`ash
+git clone <repo> && cd rag-chat
 
-```bash
-git clone <repo-url>
-cd Chatapp
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
-
+# 1. Install dependencies
+python -m venv .venv && .venv\Scripts\activate       # Windows
+# source .venv/bin/activate                           # macOS/Linux
 pip install -r requirements.txt
-```
 
-### 2. Configure environment
-
-```bash
+# 2. Configure
 cp .env.example .env
-```
+# Edit .env: set LLM_API_KEY=your-key-here
 
-Edit `.env`:
+# 3. Start PostgreSQL
+docker compose up postgres -d
 
-```env
-CEREBRAS_API_KEY=your_cerebras_api_key_here
-DATABASE_URL=postgresql://root:password@localhost:55432/chatapp
-# Optional: override model (default: gpt-oss-120b)
-# CEREBRAS_MODEL=llama3.1-8b
-```
+# 4. Run
+python cli.py dev    # http://localhost:8000
+`
 
-Get a free Cerebras API key at [cloud.cerebras.ai](https://cloud.cerebras.ai).
-
-### 3. Start PostgreSQL (Docker)
-
-```bash
-docker run -d \
-  --name chatapp-postgres \
-  -e POSTGRES_USER=root \
-  -e POSTGRES_PASSWORD=password \
-  -e POSTGRES_DB=chatapp \
-  -p 55432:5432 \
-  pgvector/pgvector:pg16
-```
-
-### 4. Index your knowledge base
-
-Edit `data.txt` with your content, then run:
-
-```bash
-python embeddings.py
-```
-
-### 5. Start the server
-
-**Option A — Docker Compose (PostgreSQL + app, one command):**
-
-```bash
+**Or with Docker (one command):**
+`ash
 docker compose up --build
-```
+`
 
-Open [http://localhost:8000](http://localhost:8000). PostgreSQL starts automatically; no separate setup needed.
+---
 
-> **First build:** downloads the base image, installs dependencies, and caches the sentence-transformers model (~80 MB to `model_cache` volume). Subsequent `docker compose up` starts are fast.
+## Project Structure
 
-**Option B — local dev (venv):**
+`
+settings.py          # Every tunable in one place (env-driven)
+hooks.py             # Extension points (decorator-based)
+cache.py             # Optional Redis cache (no-op when disabled)
+worker.py            # Background task runner
+cli.py               # Developer CLI: init, ingest, dev
 
-```bash
-# Windows
-start_server.bat
+main.py              # FastAPI app + 12-step pipeline + endpoints
+policy.py            # BehaviorPolicy engine (deterministic rules)
+context_manager.py   # Token budgeting, history trimming, LLM summarization
+query_db.py          # PostgreSQL + pgvector (all persistence)
+vector_store.py      # Document search (pgvector + numpy fallback)
+embeddings.py        # BAAI/bge-base-en-v1.5 768-dim, asymmetric retrieval
 
-# macOS/Linux
-./start_server.sh
+llm/
+  providers/
+    base.py          # LLMProvider ABC
+    cerebras.py      # Cerebras Cloud SDK
+    openai.py        # OpenAI / Azure / vLLM / Ollama
+    anthropic.py     # Anthropic Messages API
+    __init__.py      # Dynamic provider loader
+  client.py          # Thin wrapper  active provider
+  classifier.py      # Intent classification (heuristics + LLM)
+  prompts.py         # All prompt templates (single source)
+  prompt_orchestrator.py  # Policy-aware message builder
+  generators.py      # Response generation (stream + batch)
+  profile_detector.py     # Extract personal facts from messages
 
-# Or directly:
-uvicorn main:app --reload --port 8000
-```
+knowledge/           # Drop .txt/.md files here  auto-indexed
+frontend/            # React 18 + Vite + Tailwind + Vercel AI SDK
+`
 
-> When PostgreSQL isn't available the app falls back to in-memory mode automatically (conversations reset on restart).
+---
 
-## API Endpoints
+## Configuration
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/chat` | Non-streaming chat — returns full JSON |
-| `POST` | `/chat/stream` | **Streaming chat** — Vercel AI SDK SSE format |
-| `GET` | `/conversations` | List all conversations |
-| `POST` | `/conversations` | Create a new conversation |
-| `GET` | `/conversations/{id}/messages` | Fetch message history |
-| `GET` | `/profile` | Get stored user profile entries |
-| `DELETE` | `/profile/{id}` | Delete a profile entry |
-
-## Streaming Protocol
-
-`/chat/stream` outputs the [Vercel AI SDK data stream protocol](https://sdk.vercel.ai/docs/ai-sdk-ui/stream-protocol):
-
-```
-0:"token"\n                          — text delta
-8:[{"intent":..., "retrieval_info":...}]\n  — metadata annotation
-e:{"finishReason":"stop"}\n          — finish event
-d:{"finishReason":"stop"}\n          — done
-```
-
-The frontend reads these chunks with `ReadableStream` and appends tokens live with a blinking cursor.
-
-## Token Limits
-
-| Model | Max context | Response cap |
-|-------|-------------|--------------|
-| `gpt-oss-120b` | 65 536 | 2 048 |
-| `llama3.1-8b` | 8 192 | 2 048 |
-
-## Environment Variables
+All settings live in settings.py and are driven by environment variables. See .env.example for the full reference.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `CEREBRAS_API_KEY` | — | **Required** |
-| `DATABASE_URL` | — | PostgreSQL connection string |
-| `CEREBRAS_MODEL` | `gpt-oss-120b` | Model override |
+|---|---|---|
+| `LLM_PROVIDER` | `cerebras` | Provider: `cerebras`, `openai`, `anthropic` |
+| `LLM_API_KEY` |  | **Required**  your API key |
+| `LLM_MODEL` | *(provider default)* | Model name override |
+| `LLM_BASE_URL` |  | Custom endpoint (Ollama, Azure, vLLM) |
+| `DATABASE_URL` |  | Full PostgreSQL connection string |
+| `RETRIEVAL_K` | `4` | Document chunks per knowledge query |
+| `TOPIC_CONTINUATION_THRESHOLD` | `0.35` | Continuation sensitivity |
+| `CHUNK_SIZE` | `500` | Knowledge base chunk size (chars) |
+| `ENABLE_CACHE` | `false` | Redis caching for classifications + embeddings |
+| `FORCE_REINDEX` | `false` | Re-index knowledge base on every startup |
 
-## Troubleshooting
+---
 
-**Port already in use:**
-```bash
-uvicorn main:app --reload --port 8001
-```
+## CLI
 
-**FAISS not found:**
-```bash
-pip install faiss-cpu
-```
+`ash
+python cli.py init          # Scaffold project  creates knowledge/, copies .env
+python cli.py ingest        # Index knowledge base into PostgreSQL
+python cli.py ingest docs/  # Index from a custom directory
+python cli.py dev           # Start dev server (uvicorn --reload)
+`
 
-**sentence-transformers import error:**
-```bash
-pip install sentence-transformers --upgrade
-```
+---
+
+## Swapping the LLM
+
+`env
+# OpenAI
+LLM_PROVIDER=openai
+LLM_API_KEY=sk-...
+
+# Anthropic
+LLM_PROVIDER=anthropic
+LLM_API_KEY=sk-ant-...
+
+# Ollama (local)
+LLM_PROVIDER=openai
+LLM_API_KEY=ollama
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=llama3.2
+`
+
+Add a new provider: subclass `LLMProvider` from `llm/providers/base.py`.
+
+---
+
+## Extension Hooks
+
+Customize behavior without editing core files:
+
+`python
+from hooks import Hooks
+
+@Hooks.before_generation
+def inject_date(pipeline_result):
+    from datetime import date
+    pipeline_result.rag_context += f"\nDate: {date.today()}"
+    return pipeline_result
+
+@Hooks.policy_override
+def always_rag_for_questions(features, decision):
+    if "?" in features.query:
+        decision.inject_rag = True
+    return decision
+`
+
+Four hook points: `before_generation`, `after_generation`, `policy_override`, `before_persist`.
+
+---
+
+## API
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/chat/stream` | Streaming chat (Vercel AI SDK SSE) |
+| `POST` | `/chat` | Non-streaming chat |
+| `GET` | `/health` | Status, DB, document count, provider |
+| `GET/POST/PUT/DELETE` | `/conversations` | Conversation management |
+| `GET/POST/PUT/DELETE` | `/profile` | User profile management |
+
+---
+
+## Frontend
+
+AI-native React UI with observable pipeline decisions:
+
+- **Intent badge**  shows classification + confidence on every response
+- **Pipeline timeline**  real-time stage chips: Classified  Retrieved  Generating
+- **Retrieval panel**  expandable breakdown of what documents/Q&A were used
+- **Debug Mode**  raw PolicyDecision JSON on every message
+- **Command palette**  Ctrl+K quick navigation
+- **Token meter**  context window usage visualization
+
+`ash
+cd frontend && npm install && npm run dev    # port 5173
+npm run build                                # output to frontend/dist/
+`
+
+---
 
 ## License
 

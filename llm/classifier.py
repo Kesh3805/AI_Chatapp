@@ -11,6 +11,7 @@ import json
 import logging
 from typing import Optional
 
+import cache
 from .client import completion, MAX_CLASSIFIER_TOKENS
 from .prompts import INTENT_PROMPT
 
@@ -62,6 +63,12 @@ def classify_intent(
     """
     query_lower = user_query.strip().lower()
 
+    # ── Cache check ─────────────────────────────────────────────────────
+    cached = cache.get_classification(user_query)
+    if cached:
+        logger.info(f"Cache hit: intent={cached['intent']}")
+        return cached
+
     # ── Greeting fast-path (saves a full LLM round-trip) ─────────────────
     _words = query_lower.split()
     if len(_words) <= 8:
@@ -107,12 +114,11 @@ def classify_intent(
             {"role": "user", "content": f"Message: {user_query}{context_text}"},
         ]
 
-        response = completion(
+        raw = completion(
             messages,
             temperature=0.0,
             max_tokens=MAX_CLASSIFIER_TOKENS,
-        )
-        raw = response.choices[0].message.content.strip()
+        ).strip()
 
         # Robust JSON extraction
         if "```" in raw:
@@ -134,7 +140,9 @@ def classify_intent(
             logger.warning(f"Unknown intent '{intent}' → general")
             intent = "general"
 
-        return {"intent": intent, "confidence": confidence}
+        result = {"intent": intent, "confidence": confidence}
+        cache.set_classification(user_query, result)
+        return result
 
     except Exception as e:
         logger.error(f"Classification error: {e}")

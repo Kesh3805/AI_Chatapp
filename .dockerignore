@@ -1,10 +1,33 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
-*.bak
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Tests (not needed in production image)
+tests/
+
+# Dev / IDE
 .env
 .git/
 .gitignore
-*.md
-faiss_index.bin
-faiss_metadata.json
+.DS_Store
+*.bak
+
+# Docs (keep README.md — referenced by pyproject.toml)
+ARCHITECTURE.md
+knowledge/
+
+# Frontend build artifacts (served separately or via CDN)
+frontend/node_modules/
+frontend/dist/
+frontend/.next/
+
+# Stale artifacts (removed)
+# faiss_index.bin
+# faiss_metadata.json

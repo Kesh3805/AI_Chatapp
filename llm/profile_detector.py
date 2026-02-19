@@ -32,7 +32,7 @@ def detect_profile_updates(user_message: str, assistant_response: str) -> list:
         if not any(sig in lower for sig in PERSONAL_SIGNALS):
             return []
 
-        response = completion(
+        raw = completion(
             messages=[
                 {"role": "system", "content": PROFILE_DETECT_PROMPT},
                 {
@@ -45,8 +45,7 @@ def detect_profile_updates(user_message: str, assistant_response: str) -> list:
             ],
             temperature=0.0,
             max_tokens=MAX_PROFILE_DETECT_TOKENS,
-        )
-        raw = response.choices[0].message.content.strip()
+        ).strip()
 
         # Strip markdown fences if present
         if "```" in raw:
