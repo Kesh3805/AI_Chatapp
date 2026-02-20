@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -84,9 +85,11 @@ async def lifespan(app: FastAPI):  # noqa: D401
 #  App
 # ---------------------------------------------------------------------------
 app = FastAPI(title="RAG Chat", version="4.0.0", lifespan=lifespan)
+_raw_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+_allowed_origins = _raw_origins if _raw_origins else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -100,6 +103,7 @@ class ChatRequest(BaseModel):
     user_query: str
     conversation_id: Optional[str] = None
     tags: Optional[List[str]] = None
+    user_id: str = settings.DEFAULT_USER_ID
 
 
 class RenameRequest(BaseModel):
@@ -114,6 +118,7 @@ class ProfileEntryRequest(BaseModel):
     key: str
     value: str
     category: str = "general"
+    user_id: str = settings.DEFAULT_USER_ID
 
 
 def _ingest_knowledge():
@@ -136,10 +141,71 @@ def _ingest_knowledge():
 
 
 def _chunk_text(text: str) -> list[str]:
-    """Split text into overlapping chunks based on settings."""
+    """Split text into semantic chunks: paragraphs → sentences → character fallback.
+
+    Strategy:
+      1. Split on blank lines to get natural paragraphs.
+      2. Paragraphs that fit within CHUNK_SIZE are kept whole.
+      3. Paragraphs larger than CHUNK_SIZE are sentence-split first.
+      4. Sentences (or fragments) larger than CHUNK_SIZE fall back to
+         character windows — the same legacy behaviour, but only as a
+         last resort rather than the primary path.
+      5. Consecutive small chunks are merged up to CHUNK_SIZE so we
+         avoid many tiny fragments.
+    """
+
     size = settings.CHUNK_SIZE
-    stride = size - settings.CHUNK_OVERLAP
-    return [text[i : i + size] for i in range(0, len(text), stride) if text[i : i + size].strip()]
+    overlap = settings.CHUNK_OVERLAP
+
+    # ── 1. Paragraph split ────────────────────────────────────────
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+
+    # ── 2. Flatten each paragraph into sentence-level atoms ───────
+    atoms: list[str] = []
+    for para in paragraphs:
+        if len(para) <= size:
+            atoms.append(para)
+        else:
+            # Sentence split on .  !  ?  followed by whitespace
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", para) if s.strip()]
+            for sent in sentences:
+                if len(sent) <= size:
+                    atoms.append(sent)
+                else:
+                    # Character-window fallback for very long sentences
+                    stride = max(1, size - overlap)
+                    for i in range(0, len(sent), stride):
+                        fragment = sent[i : i + size]
+                        if fragment.strip():
+                            atoms.append(fragment)
+
+    # ── 3. Merge small atoms into chunks up to `size` ─────────────
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+
+    def _flush():
+        if current_parts:
+            chunks.append(" ".join(current_parts))
+
+    for atom in atoms:
+        atom_len = len(atom)
+        # +1 for the space separator
+        if current_parts and current_len + 1 + atom_len > size:
+            _flush()
+            # Start next chunk with overlap: carry the tail of the last chunk
+            if overlap > 0 and current_parts:
+                tail = " ".join(current_parts)[-overlap:]
+                current_parts = [tail]
+                current_len = len(tail)
+            else:
+                current_parts = []
+                current_len = 0
+        current_parts.append(atom)
+        current_len += (1 + atom_len) if len(current_parts) > 1 else atom_len
+
+    _flush()
+    return [c for c in chunks if c.strip()]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -161,6 +227,7 @@ class PipelineResult:
     query_embedding: Any
     intent: str
     confidence: float
+    user_id: str = settings.DEFAULT_USER_ID
     rag_context: str = ""
     profile_context: str = ""
     similar_qa_context: str = ""
@@ -198,7 +265,7 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
         fut_embed = pool.submit(get_query_embedding, query)
         if DB_ENABLED:
             fut_history = pool.submit(query_db.get_recent_chat_messages, cid, 20)
-            fut_profile = pool.submit(query_db.get_user_profile)
+            fut_profile = pool.submit(query_db.get_user_profile, request.user_id)
     query_embedding = fut_embed.result()
     if DB_ENABLED:
         recent_messages = fut_history.result()
@@ -313,6 +380,7 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
         query_embedding=query_embedding,
         intent=intent,
         confidence=confidence,
+        user_id=request.user_id,
         rag_context=rag_context,
         profile_context=profile_context,
         similar_qa_context=similar_qa_context,
@@ -343,16 +411,19 @@ def persist_after_response(p: PipelineResult, response_text: str):
                 embedding=p.query_embedding,
                 response_text=response_text,
                 conversation_id=p.cid,
+                user_id=p.user_id,
                 tags=p.query_tags,
                 metadata={"intent": p.intent, "tags": p.query_tags},
             )
             query_db.update_topic_vector(p.cid, p.query_embedding, alpha=settings.TOPIC_DECAY_ALPHA)
             query_db.store_chat_message(
                 role="user", content=p.query, conversation_id=p.cid,
+                user_id=p.user_id,
                 tags=p.query_tags, metadata={"intent": p.intent},
             )
             query_db.store_chat_message(
                 role="assistant", content=response_text, conversation_id=p.cid,
+                user_id=p.user_id,
                 metadata={"intent": p.intent},
             )
             query_db.increment_message_count(p.cid, 2)
@@ -371,6 +442,7 @@ def persist_after_response(p: PipelineResult, response_text: str):
                 query_db.update_profile_entry(
                     entry["key"], entry["value"],
                     category=entry.get("category", "general"),
+                    user_id=p.user_id,
                 )
         except Exception as e:
             logger.error(f"Persist error: {e}")
@@ -444,10 +516,10 @@ def delete_conversation(conversation_id: str):
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.get("/profile")
-def get_profile():
+def get_profile(user_id: str = settings.DEFAULT_USER_ID):
     if not DB_ENABLED:
         return {"entries": [], "count": 0}
-    entries = query_db.get_user_profile()
+    entries = query_db.get_user_profile(user_id)
     return {"entries": entries, "count": len(entries)}
 
 
@@ -455,20 +527,20 @@ def get_profile():
 def add_profile_entry(req: ProfileEntryRequest):
     if not DB_ENABLED:
         raise HTTPException(503, "Database not available")
-    pid = query_db.update_profile_entry(req.key, req.value, category=req.category)
+    pid = query_db.update_profile_entry(req.key, req.value, category=req.category, user_id=req.user_id)
     if not pid:
         raise HTTPException(500, "Failed to add profile entry")
-    return {"id": pid, "key": req.key, "value": req.value, "category": req.category}
+    return {"id": pid, "key": req.key, "value": req.value, "category": req.category, "user_id": req.user_id}
 
 
 @app.put("/profile/{entry_id}")
 def update_profile(entry_id: int, req: ProfileEntryRequest):
     if not DB_ENABLED:
         raise HTTPException(503, "Database not available")
-    pid = query_db.update_profile_entry(req.key, req.value, category=req.category)
+    pid = query_db.update_profile_entry(req.key, req.value, category=req.category, user_id=req.user_id)
     if not pid:
         raise HTTPException(500, "Failed to update profile entry")
-    return {"id": pid, "key": req.key, "value": req.value, "category": req.category}
+    return {"id": pid, "key": req.key, "value": req.value, "category": req.category, "user_id": req.user_id}
 
 
 @app.delete("/profile/{entry_id}")

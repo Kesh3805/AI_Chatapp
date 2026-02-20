@@ -110,7 +110,13 @@ class Settings:
     ENABLE_CACHE: bool = _env_bool("ENABLE_CACHE", False)
     REDIS_URL: str = _env("REDIS_URL", "redis://localhost:6379/0")
     CACHE_TTL: int = _env_int("CACHE_TTL", 3600)
-
+    # ── Security ────────────────────────────────────────────────
+    # Comma-separated origins allowed by CORS middleware.
+    # Use "*" for local dev only — always restrict in production.
+    # Example: ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+    ALLOWED_ORIGINS: str = _env("ALLOWED_ORIGINS", "*")
+    # Default user identity when no user_id is included in a ChatRequest.
+    DEFAULT_USER_ID: str = _env("DEFAULT_USER_ID", "public")
     # ── Server ────────────────────────────────────────────────────
     HOST: str = _env("HOST", "0.0.0.0")
     PORT: int = _env_int("PORT", 8000)

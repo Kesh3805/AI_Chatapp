@@ -119,14 +119,35 @@ def init_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_profile (
                 id          SERIAL PRIMARY KEY,
+                user_id     TEXT NOT NULL DEFAULT 'public',
                 key         TEXT NOT NULL,
                 value       TEXT NOT NULL,
                 category    TEXT DEFAULT 'general',
                 created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(key)
+                UNIQUE(user_id, key)
             );
         """)
+
+        # Migration: add user_id column to existing user_profile tables
+        try:
+            cur.execute(
+                "ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS "
+                "user_id TEXT NOT NULL DEFAULT 'public';"
+            )
+        except Exception:
+            pass
+        # Migration: replace single-key unique constraint with (user_id, key)
+        try:
+            cur.execute(
+                "ALTER TABLE user_profile DROP CONSTRAINT IF EXISTS user_profile_key_key;"
+            )
+            cur.execute(
+                "ALTER TABLE user_profile "
+                "ADD CONSTRAINT user_profile_user_id_key_key UNIQUE (user_id, key);"
+            )
+        except Exception:
+            pass
 
         # ── user_queries (semantic search over past Q&A) ──────────
         _dim = settings.EMBEDDING_DIMENSION
@@ -215,15 +236,17 @@ def init_db():
 #  USER PROFILE  (structured identity data – replaces "memories")
 # ═══════════════════════════════════════════════════════════════════
 
-def get_user_profile() -> list:
-    """Get all profile entries as a list of dicts."""
+def get_user_profile(user_id: str = "public") -> list:
+    """Get all profile entries for a user as a list of dicts."""
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
             SELECT id, key, value, category, created_at, updated_at
-            FROM user_profile ORDER BY category, key;
-        """)
+            FROM user_profile
+            WHERE user_id = %s
+            ORDER BY category, key;
+        """, (user_id,))
         rows = cur.fetchall()
         cur.close(); put_connection(conn)
         return [
@@ -237,9 +260,9 @@ def get_user_profile() -> list:
         return []
 
 
-def get_profile_as_text() -> str:
+def get_profile_as_text(user_id: str = "public") -> str:
     """Format the full user profile as a concise text block for LLM injection."""
-    entries = get_user_profile()
+    entries = get_user_profile(user_id)
     if not entries:
         return ""
     lines = []
@@ -252,23 +275,39 @@ def get_profile_as_text() -> str:
     return "\n".join(lines)
 
 
-def update_profile_entry(key: str, value: str, category: str = "general") -> int:
-    """Upsert a profile entry (insert or update by key)."""
+def update_profile_entry(
+    key: str,
+    value: str,
+    category: str = "general",
+    user_id: str = "public",
+) -> int:
+    """Upsert a profile entry keyed on (user_id, key)."""
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO user_profile (key, value, category)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (key) DO UPDATE
-            SET value = EXCLUDED.value,
-                category = EXCLUDED.category,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id;
-        """, (key.strip(), value.strip(), category.strip()))
-        pid = cur.fetchone()[0]
+        # Manual upsert so we scope by (user_id, key) regardless of DB version
+        cur.execute(
+            "SELECT id FROM user_profile WHERE user_id = %s AND key = %s;",
+            (user_id, key.strip()),
+        )
+        row = cur.fetchone()
+        if row:
+            pid = row[0]
+            cur.execute(
+                "UPDATE user_profile "
+                "SET value = %s, category = %s, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = %s;",
+                (value.strip(), category.strip(), pid),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO user_profile (user_id, key, value, category) "
+                "VALUES (%s, %s, %s, %s) RETURNING id;",
+                (user_id, key.strip(), value.strip(), category.strip()),
+            )
+            pid = cur.fetchone()[0]
         conn.commit(); cur.close(); put_connection(conn)
-        logger.info(f"Profile upserted #{pid}: {key} = {value[:60]}")
+        logger.info(f"Profile upserted #{pid} [user={user_id}]: {key} = {value[:60]}")
         return pid
     except Exception as e:
         logger.error(f"Error upserting profile entry: {e}")
