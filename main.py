@@ -19,7 +19,7 @@ Pipeline (shared by /chat and /chat/stream):
   7. Selective retrieval  (driven by policy decision)
   8. Generate response
   9. Persist         (DB writes via worker)
-"""""
+"""
 
 from __future__ import annotations
 
@@ -264,7 +264,7 @@ def run_pipeline(request: ChatRequest) -> PipelineResult:
     with ThreadPoolExecutor(max_workers=3) as pool:
         fut_embed = pool.submit(get_query_embedding, query)
         if DB_ENABLED:
-            fut_history = pool.submit(query_db.get_recent_chat_messages, cid, 20)
+            fut_history = pool.submit(query_db.get_recent_chat_messages, cid, settings.HISTORY_FETCH_LIMIT)
             fut_profile = pool.submit(query_db.get_user_profile, request.user_id)
     query_embedding = fut_embed.result()
     if DB_ENABLED:
@@ -600,7 +600,11 @@ def chat_stream(request: ChatRequest):
         e:{"finishReason":..}\\n  finish
         d:{"finishReason":..}\\n  done
     """
-    p = run_pipeline(request)
+    try:
+        p = run_pipeline(request)
+    except Exception as exc:
+        logger.error("Pipeline error in chat_stream: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
     collected: list[str] = []
 
     def event_stream():

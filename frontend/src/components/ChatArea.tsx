@@ -45,6 +45,7 @@ export default function ChatArea({ chat }: Props) {
         {!sidebarOpen && (
           <button
             onClick={toggleSidebar}
+            title="Open sidebar"
             className="p-2 text-sidebar-muted hover:text-white rounded-lg
                        hover:bg-sidebar-hover transition-colors"
           >
@@ -91,6 +92,7 @@ export default function ChatArea({ chat }: Props) {
       {showScrollBtn && (
         <button
           onClick={scrollToBottom}
+          title="Scroll to bottom"
           className="absolute bottom-28 left-1/2 -translate-x-1/2 p-2 rounded-full
                      bg-sidebar-hover/90 text-white shadow-lg hover:bg-sidebar-active
                      transition-all z-10"

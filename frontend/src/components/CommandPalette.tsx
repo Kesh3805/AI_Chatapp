@@ -146,7 +146,7 @@ export default function CommandPalette() {
             placeholder="Type a command…"
             className="flex-1 bg-transparent text-sm text-white placeholder:text-sidebar-muted outline-none"
           />
-          <button onClick={close} className="text-sidebar-muted hover:text-white transition-colors">
+          <button onClick={close} title="Close" className="text-sidebar-muted hover:text-white transition-colors">
             <X size={14} />
           </button>
         </div>

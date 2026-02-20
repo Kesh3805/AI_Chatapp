@@ -92,7 +92,9 @@ def generate_title(user_message: str) -> str:
             {"role": "user", "content": user_message},
         ]
         title = completion(messages, temperature=0.5, max_tokens=MAX_TITLE_TOKENS).strip().strip('"').strip("'")
-        return title[:50] if len(title) > 50 else title
+        if len(title) > 50:
+            title = title[:50].rsplit(" ", 1)[0] or title[:50]
+        return title
     except Exception as e:
         logger.error("Title generation error: %s", e)
         words = user_message.split()[:5]

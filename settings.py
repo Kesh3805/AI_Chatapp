@@ -79,7 +79,11 @@ class Settings:
     MAX_HISTORY_TOKENS: int = _env_int("MAX_HISTORY_TOKENS", 8000)
     # When True, old turns beyond MAX_HISTORY_TOKENS are summarized by the LLM
     # instead of silently dropped.  Costs one extra LLM call.
-    ENABLE_HISTORY_SUMMARIZATION: bool = _env_bool("ENABLE_HISTORY_SUMMARIZATION", False)
+    ENABLE_HISTORY_SUMMARIZATION: bool = _env_bool("ENABLE_HISTORY_SUMMARIZATION", True)
+    # How many recent chat messages to load from DB per request.
+    # Higher values give the summarizer more material to work from;
+    # the token budget (MAX_HISTORY_TOKENS) keeps the LLM context bounded.
+    HISTORY_FETCH_LIMIT: int = _env_int("HISTORY_FETCH_LIMIT", 100)
 
     # ── Pipeline ──────────────────────────────────────────────────
     TOPIC_CONTINUATION_THRESHOLD: float = _env_float(

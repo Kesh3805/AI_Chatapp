@@ -3,6 +3,7 @@
  *
  * Shows estimated token usage relative to the model's context window.
  */
+import type { CSSProperties } from 'react';
 
 interface Props {
   /** Estimated tokens used in the prompt+response */
@@ -27,8 +28,8 @@ export default function AITokenMeter({ used, limit = DEFAULT_LIMIT }: Props) {
       <span>~{used.toLocaleString()} tokens</span>
       <div className="w-16 h-1.5 rounded-full bg-sidebar-border overflow-hidden">
         <div
-          className={`h-full rounded-full transition-all ${color}`}
-          style={{ width: `${pct}%` }}
+          className={`h-full rounded-full transition-all token-progress-bar ${color}`}
+          style={{ '--progress': `${pct}%` } as CSSProperties}
         />
       </div>
       <span className="opacity-50">{pct.toFixed(0)}%</span>

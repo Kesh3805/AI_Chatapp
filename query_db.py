@@ -68,7 +68,16 @@ def get_connection():
 
 
 def put_connection(conn):
-    """Return a connection to the pool."""
+    """Return a connection to the pool, rolling back any dirty transaction first."""
+    if conn is None:
+        return
+    try:
+        # A failed statement leaves psycopg2 in an aborted-transaction state.
+        # Rolling back here ensures every recycled connection is clean.
+        if conn.status != 1:  # 1 = STATUS_READY (idle, no open transaction)
+            conn.rollback()
+    except Exception:
+        pass
     try:
         _get_pool().putconn(conn)
     except Exception:
@@ -81,8 +90,12 @@ def put_connection(conn):
 
 def init_db():
     """Create all tables needed for the intent-gated architecture."""
+    conn = None
     try:
         conn = psycopg2.connect(**DB_CONFIG)
+        # autocommit=True means each statement runs in its own implicit transaction.
+        # This prevents a failed migration ALTER TABLE from aborting all subsequent DDL.
+        conn.autocommit = True
         cur = conn.cursor()
 
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
@@ -221,15 +234,16 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_doc_chunks_src ON document_chunks(source);"
         )
 
-        conn.commit()
         cur.close()
-        conn.close()
         logger.info("Database initialized – intent-gated architecture ready")
         return True
 
     except Exception as e:
         logger.error(f"Error initializing database: {e}")
         return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -238,6 +252,7 @@ def init_db():
 
 def get_user_profile(user_id: str = "public") -> list:
     """Get all profile entries for a user as a list of dicts."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -248,7 +263,7 @@ def get_user_profile(user_id: str = "public") -> list:
             ORDER BY category, key;
         """, (user_id,))
         rows = cur.fetchall()
-        cur.close(); put_connection(conn)
+        cur.close()
         return [
             {"id": r[0], "key": r[1], "value": r[2], "category": r[3],
              "created_at": r[4].isoformat() if r[4] else None,
@@ -258,6 +273,9 @@ def get_user_profile(user_id: str = "public") -> list:
     except Exception as e:
         logger.error(f"Error getting user profile: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def get_profile_as_text(user_id: str = "public") -> str:
@@ -280,8 +298,9 @@ def update_profile_entry(
     value: str,
     category: str = "general",
     user_id: str = "public",
-) -> int:
+) -> int | None:
     """Upsert a profile entry keyed on (user_id, key)."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -306,26 +325,33 @@ def update_profile_entry(
                 (user_id, key.strip(), value.strip(), category.strip()),
             )
             pid = cur.fetchone()[0]
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         logger.info(f"Profile upserted #{pid} [user={user_id}]: {key} = {value[:60]}")
         return pid
     except Exception as e:
         logger.error(f"Error upserting profile entry: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def delete_profile_entry(entry_id: int) -> bool:
     """Delete a profile entry by ID."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("DELETE FROM user_profile WHERE id = %s;", (entry_id,))
         ok = cur.rowcount > 0
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         return ok
     except Exception as e:
         logger.error(f"Error deleting profile entry: {e}")
         return False
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -347,6 +373,7 @@ def retrieve_similar_queries(query_embedding, k=5, conversation_id=None,
     min_similarity: threshold below which results are discarded.
     Prevents injecting irrelevant context when nothing good matches.
     """
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -362,7 +389,7 @@ def retrieve_similar_queries(query_embedding, k=5, conversation_id=None,
         """, (emb, emb, max(k * 4, 16)))
 
         results = cur.fetchall()
-        cur.close(); put_connection(conn)
+        cur.close()
 
         tag_set = set(current_tags or [])
         ranked = []
@@ -388,10 +415,14 @@ def retrieve_similar_queries(query_embedding, k=5, conversation_id=None,
     except Exception as e:
         logger.error(f"Error retrieving similar queries: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def retrieve_same_conversation_queries(query_embedding, conversation_id, k=4, min_similarity=0.2):
     """Retrieve similar past Q&A from the SAME conversation only."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -407,7 +438,7 @@ def retrieve_same_conversation_queries(query_embedding, conversation_id, k=4, mi
         """, (emb, conversation_id, emb, k))
 
         results = cur.fetchall()
-        cur.close(); put_connection(conn)
+        cur.close()
 
         return [
             {"id": r[0], "query": r[1], "response": r[2], "similarity": float(r[3])}
@@ -417,6 +448,9 @@ def retrieve_same_conversation_queries(query_embedding, conversation_id, k=4, mi
     except Exception as e:
         logger.error(f"Error retrieving same-conv queries: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -425,6 +459,7 @@ def retrieve_same_conversation_queries(query_embedding, conversation_id, k=4, mi
 
 def get_topic_vector(conversation_id: str):
     """Return the current topic embedding for a conversation, or None."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -433,7 +468,7 @@ def get_topic_vector(conversation_id: str):
             (conversation_id,)
         )
         row = cur.fetchone()
-        cur.close(); put_connection(conn)
+        cur.close()
         if row and row[0] is not None:
             # psycopg2 returns pgvector as a list-like string; convert to np array
             vec = row[0]
@@ -444,6 +479,9 @@ def get_topic_vector(conversation_id: str):
     except Exception as e:
         logger.error(f"Error getting topic vector: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def update_topic_vector(conversation_id: str, new_embedding, alpha: float = 0.1):
@@ -452,6 +490,7 @@ def update_topic_vector(conversation_id: str, new_embedding, alpha: float = 0.1)
     On first message, sets the topic vector directly.
     alpha=0.1 means the topic shifts slowly – 10% weight to each new message.
     """
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -481,9 +520,12 @@ def update_topic_vector(conversation_id: str, new_embedding, alpha: float = 0.1)
             "UPDATE conversations SET topic_embedding = %s::vector WHERE id = %s;",
             (blended, conversation_id)
         )
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
     except Exception as e:
         logger.error(f"Error updating topic vector: {e}")
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def get_similar_messages_in_conversation(query_embedding, conversation_id: str,
@@ -491,6 +533,7 @@ def get_similar_messages_in_conversation(query_embedding, conversation_id: str,
     """Retrieve the top-k most semantically similar past Q&A turns within a
     single conversation. Used to supplement recency window with relevance.
     """
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -507,7 +550,7 @@ def get_similar_messages_in_conversation(query_embedding, conversation_id: str,
         """, (emb, conversation_id, emb, k * 3))
 
         results = cur.fetchall()
-        cur.close(); put_connection(conn)
+        cur.close()
 
         return [
             {"query": r[0], "response": r[1], "similarity": float(r[2])}
@@ -517,6 +560,9 @@ def get_similar_messages_in_conversation(query_embedding, conversation_id: str,
     except Exception as e:
         logger.error(f"Error retrieving similar conv messages: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -546,6 +592,7 @@ def infer_tags(query_text):
 # ═══════════════════════════════════════════════════════════════════
 
 def create_conversation(title="New Chat"):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -555,14 +602,18 @@ def create_conversation(title="New Chat"):
             (cid, title),
         )
         r = cur.fetchone()
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         return {"id": r[0], "title": r[1], "created_at": r[2].isoformat() if r[2] else None}
     except Exception as e:
         logger.error(f"Error creating conversation: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def list_conversations(limit=50):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -574,7 +625,7 @@ def list_conversations(limit=50):
             LIMIT %s;
         """, (limit,))
         rows = cur.fetchall()
-        cur.close(); put_connection(conn)
+        cur.close()
         return [
             {"id": r[0], "title": r[1],
              "created_at": r[2].isoformat() if r[2] else None,
@@ -585,15 +636,19 @@ def list_conversations(limit=50):
     except Exception as e:
         logger.error(f"Error listing conversations: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def get_conversation(conversation_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT id, title, created_at, updated_at FROM conversations WHERE id = %s;", (conversation_id,))
         r = cur.fetchone()
-        cur.close(); put_connection(conn)
+        cur.close()
         if not r:
             return None
         return {"id": r[0], "title": r[1],
@@ -602,9 +657,13 @@ def get_conversation(conversation_id):
     except Exception as e:
         logger.error(f"Error getting conversation: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def rename_conversation(conversation_id, new_title):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -613,14 +672,18 @@ def rename_conversation(conversation_id, new_title):
             (new_title, conversation_id),
         )
         r = cur.fetchone()
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         return {"id": r[0], "title": r[1]} if r else None
     except Exception as e:
         logger.error(f"Error renaming conversation: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def delete_conversation(conversation_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -628,25 +691,33 @@ def delete_conversation(conversation_id):
         cur.execute("DELETE FROM user_queries WHERE conversation_id = %s;", (conversation_id,))
         cur.execute("DELETE FROM conversations WHERE id = %s;", (conversation_id,))
         ok = cur.rowcount > 0
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         return ok
     except Exception as e:
         logger.error(f"Error deleting conversation: {e}")
         return False
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def touch_conversation(conversation_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=%s;", (conversation_id,))
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
     except Exception as e:
         logger.error(f"Error touching conversation: {e}")
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def increment_message_count(conversation_id: str, amount: int = 1):
     """Increment the message counter on a conversation."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -658,11 +729,14 @@ def increment_message_count(conversation_id: str, amount: int = 1):
             RETURNING message_count;
         """, (amount, conversation_id))
         row = cur.fetchone()
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         return row[0] if row else 0
     except Exception as e:
         logger.error(f"Error incrementing msg count: {e}")
         return 0
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -671,6 +745,7 @@ def increment_message_count(conversation_id: str, amount: int = 1):
 
 def store_query(query_text, embedding, response_text="", conversation_id=None,
                 user_id="public", metadata=None, tags=None):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -682,15 +757,19 @@ def store_query(query_text, embedding, response_text="", conversation_id=None,
         """, (query_text, emb, user_id, conversation_id, response_text,
               tags or infer_tags(query_text), Json(metadata or {})))
         qid = cur.fetchone()[0]
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         return qid
     except Exception as e:
         logger.error(f"Error storing query: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def store_chat_message(role, content, conversation_id=None,
                        user_id="public", tags=None, metadata=None):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -699,14 +778,18 @@ def store_chat_message(role, content, conversation_id=None,
             VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
         """, (user_id, conversation_id, role, content, tags or ["general"], Json(metadata or {})))
         mid = cur.fetchone()[0]
-        conn.commit(); cur.close(); put_connection(conn)
+        conn.commit(); cur.close()
         return mid
     except Exception as e:
         logger.error(f"Error storing chat message: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def get_conversation_messages(conversation_id, limit=200):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -716,7 +799,7 @@ def get_conversation_messages(conversation_id, limit=200):
             ORDER BY timestamp ASC LIMIT %s;
         """, (conversation_id, limit))
         rows = cur.fetchall()
-        cur.close(); put_connection(conn)
+        cur.close()
         return [
             {"role": r[0], "content": r[1], "tags": r[2] or [],
              "timestamp": r[3].isoformat() if r[3] else None, "id": r[4]}
@@ -725,9 +808,13 @@ def get_conversation_messages(conversation_id, limit=200):
     except Exception as e:
         logger.error(f"Error getting conversation messages: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def get_recent_chat_messages(conversation_id, limit=10):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -737,14 +824,18 @@ def get_recent_chat_messages(conversation_id, limit=10):
             ORDER BY timestamp DESC LIMIT %s;
         """, (conversation_id, limit))
         rows = cur.fetchall()
-        cur.close(); put_connection(conn)
+        cur.close()
         return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
     except Exception as e:
         logger.error(f"Error getting recent msgs: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def get_first_user_message(conversation_id):
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -754,11 +845,14 @@ def get_first_user_message(conversation_id):
             ORDER BY timestamp ASC LIMIT 1;
         """, (conversation_id,))
         r = cur.fetchone()
-        cur.close(); put_connection(conn)
+        cur.close()
         return r[0] if r else None
     except Exception as e:
         logger.error(f"Error getting first msg: {e}")
         return None
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 # ═══════════════════ DOCUMENT CHUNKS (pgvector knowledge base) ═══════════════════
@@ -767,6 +861,7 @@ def store_document_chunks(chunks: list[str], source: str = "default") -> int:
     """Embed and store document chunks in pgvector.  Returns count stored."""
     if not chunks:
         return 0
+    conn = None
     try:
         from embeddings import get_embeddings
 
@@ -780,16 +875,19 @@ def store_document_chunks(chunks: list[str], source: str = "default") -> int:
             """, (chunk, emb.tolist(), source, i))
         conn.commit()
         cur.close()
-        put_connection(conn)
         logger.info(f"Stored {len(chunks)} chunks (source={source})")
         return len(chunks)
     except Exception as e:
         logger.error(f"Error storing document chunks: {e}")
         return 0
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def search_document_chunks(embedding, k: int = 4) -> list[str]:
     """Semantic search over document chunks.  Returns chunk content strings."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -802,30 +900,36 @@ def search_document_chunks(embedding, k: int = 4) -> list[str]:
         """, (emb, emb, k))
         results = cur.fetchall()
         cur.close()
-        put_connection(conn)
         return [r[0] for r in results]
     except Exception as e:
         logger.error(f"Error searching document chunks: {e}")
         return []
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def count_document_chunks() -> int:
     """Return the total number of indexed document chunks."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM document_chunks")
         count = cur.fetchone()[0]
         cur.close()
-        put_connection(conn)
         return count
     except Exception as e:
         logger.error(f"Error counting document chunks: {e}")
         return 0
+    finally:
+        if conn is not None:
+            put_connection(conn)
 
 
 def clear_document_chunks(source: str | None = None) -> None:
     """Delete document chunks (optionally filtered by source)."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -835,6 +939,8 @@ def clear_document_chunks(source: str | None = None) -> None:
             cur.execute("DELETE FROM document_chunks")
         conn.commit()
         cur.close()
-        put_connection(conn)
     except Exception as e:
         logger.error(f"Error clearing document chunks: {e}")
+    finally:
+        if conn is not None:
+            put_connection(conn)

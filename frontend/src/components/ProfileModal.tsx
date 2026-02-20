@@ -35,6 +35,7 @@ export default function ProfileModal() {
           <h2 className="text-lg font-semibold text-white">Profile & Memory</h2>
           <button
             onClick={() => setProfileModalOpen(false)}
+            title="Close"
             className="p-1.5 rounded-lg hover:bg-sidebar-hover text-sidebar-muted
                        hover:text-white transition-colors"
           >
@@ -67,6 +68,7 @@ export default function ProfileModal() {
                   </div>
                   <button
                     onClick={() => deleteProfileEntry(entry.id)}
+                    title="Delete entry"
                     className="p-1.5 rounded-lg opacity-0 group-hover:opacity-100
                                text-sidebar-muted hover:text-danger transition-all"
                   >
@@ -93,6 +95,8 @@ export default function ProfileModal() {
             <select
               value={category}
               onChange={(e) => setCategory(e.target.value)}
+              title="Category"
+              aria-label="Category"
               className="px-3 py-2 text-sm bg-input-bg border border-input-border rounded-lg
                          text-gray-200 outline-none focus:border-accent/50"
             >

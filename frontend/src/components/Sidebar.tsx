@@ -85,6 +85,7 @@ export default function Sidebar() {
         </button>
         <button
           onClick={toggleSidebar}
+          title="Close sidebar"
           className="p-2 text-sidebar-muted hover:text-sidebar-text rounded-lg
                      hover:bg-sidebar-hover transition-colors"
         >
@@ -120,6 +121,8 @@ export default function Sidebar() {
             {editingId === c.id ? (
               <div className="flex items-center gap-1 flex-1 min-w-0">
                 <input
+                  title="Rename conversation"
+                  placeholder="Conversation name"
                   value={editTitle}
                   onChange={(e) => setEditTitle(e.target.value)}
                   onKeyDown={(e) => {
@@ -131,21 +134,23 @@ export default function Sidebar() {
                   onClick={(e) => e.stopPropagation()}
                 />
                 <button onClick={(e) => { e.stopPropagation(); confirmEdit(); }}
-                  className="p-0.5 hover:text-accent"><Check size={12} /></button>
+                  title="Confirm" className="p-0.5 hover:text-accent"><Check size={12} /></button>
                 <button onClick={(e) => { e.stopPropagation(); setEditingId(null); }}
-                  className="p-0.5 hover:text-danger"><X size={12} /></button>
+                  title="Cancel" className="p-0.5 hover:text-danger"><X size={12} /></button>
               </div>
             ) : (
               <>
                 <span className="truncate flex-1">{c.title}</span>
                 <div className="hidden group-hover:flex items-center gap-0.5">
                   <button
+                    title="Rename"
                     onClick={(e) => { e.stopPropagation(); startEdit(c.id, c.title); }}
                     className="p-1 rounded hover:bg-sidebar-bg text-sidebar-muted hover:text-sidebar-text"
                   >
                     <Pencil size={12} />
                   </button>
                   <button
+                    title="Delete"
                     onClick={(e) => { e.stopPropagation(); removeConversation(c.id); }}
                     className="p-1 rounded hover:bg-sidebar-bg text-sidebar-muted hover:text-danger"
                   >
